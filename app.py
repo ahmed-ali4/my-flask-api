@@ -4,89 +4,170 @@ import pickle
 import pandas as pd
 from flask import Flask, request, jsonify
 
+# Initialize Flask application
 app = Flask(__name__)
 
-# 1. Load model.pkl (trained on raw price)
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model.pkl')
-with open(MODEL_PATH, 'rb') as f:
-    model = pickle.load(f)
+# ========================================================================
+# Configuration and Model Loading with Error Handling
+# ========================================================================
 
-# 2. Load config.json
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    cfg = json.load(f)
+def load_configuration(file_path):
+    """Load and validate configuration file"""
+    try:
+        with open(file_path, 'r') as config_file:
+            config = json.load(config_file)
+            
+        # Validate required configuration structure
+        required_keys = ['finishing_status', 'areas', 'area_compounds', 'compound_avg', 'global_avg']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required key in config: {key}")
+                
+        return config
+    except Exception as e:
+        raise RuntimeError(f"Config loading failed: {str(e)}")
+
+def load_ml_model(file_path):
+    """Load and validate ML model"""
+    try:
+        with open(file_path, 'rb') as model_file:
+            model = pickle.load(model_file)
+            
+        # Basic model validation
+        if not hasattr(model, 'predict'):
+            raise ValueError("Loaded model doesn't have predict method")
+            
+        return model
+    except Exception as e:
+        raise RuntimeError(f"Model loading failed: {str(e)}")
+
+# Load critical files with explicit error handling
+try:
+    # Load ML model
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model.pkl')
+    model = load_ml_model(MODEL_PATH)
+    
+    # Load configuration
+    CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+    cfg = load_configuration(CONFIG_PATH)
+except RuntimeError as e:
+    print(f"CRITICAL STARTUP ERROR: {str(e)}")
+    exit(1)  # Prevent deployment if files are missing
+
+# ========================================================================
+# API Endpoints
+# ========================================================================
 
 @app.route('/config', methods=['GET'])
 def get_config():
-    """
-    Return the categorical configuration and compound averages.
-    """
-    return jsonify(cfg)  # wraps Python dict into JSON response :contentReference[oaicite:0]{index=0}
+    """Return complete configuration"""
+    return jsonify({
+        "status": "success",
+        "config": cfg
+    }), 200
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Accept JSON with keys:
-      - finishing_status, area, compound
-      - size, bedrooms, bathrooms
-    Validate inputs, compute compound_avg from cfg,
-    build a DataFrame, and return predicted price.
-    """
-    data = request.get_json()  # parses application/json body :contentReference[oaicite:1]{index=1}
-    # Required fields
-    required = ["finishing_status","area","compound","size","bedrooms","bathrooms"]
-    missing = [k for k in required if k not in data]
+    """Handle price prediction requests"""
+    # Input validation
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+        
+    data = request.get_json()
+    
+    # Required fields check
+    required_fields = ["finishing_status", "area", "compound", 
+                      "size", "bedrooms", "bathrooms"]
+    missing = [field for field in required_fields if field not in data]
     if missing:
-        return jsonify({"error":f"Missing fields: {missing}"}), 400
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
 
-    # Cast numeric fields
+    # Numeric validation
     try:
-        size = float(data["size"])
-        bedrooms = int(data["bedrooms"])
-        bathrooms = int(data["bathrooms"])
+        numeric_data = {
+            "size": float(data["size"]),
+            "bedrooms": int(data["bedrooms"]),
+            "bathrooms": int(data["bathrooms"])
+        }
     except (ValueError, TypeError):
-        return jsonify({"error":"Size, bedrooms, and bathrooms must be numbers."}), 400
+        return jsonify({"error": "Invalid numeric format"}), 400
 
-    fs = data["finishing_status"]
-    area = data["area"]
-    comp = data["compound"]
+    # Categorical validation
+    validation_errors = []
+    
+    # Finishing status check
+    if data["finishing_status"] not in cfg["finishing_status"]:
+        validation_errors.append(
+            f"Invalid finishing_status. Valid options: {cfg['finishing_status']}"
+        )
+        
+    # Area check
+    if data["area"] not in cfg["areas"]:
+        validation_errors.append(
+            f"Invalid area. Valid options: {cfg['areas']}"
+        )
+    else:
+        # Compound validation per area
+        allowed_compounds = cfg["area_compounds"].get(data["area"], [])
+        if data["compound"] not in allowed_compounds:
+            validation_errors.append(
+                f"Invalid compound for {data['area']}. Valid options: {allowed_compounds}"
+            )
 
-    # Validate categorical
-    errors = []
-    if fs not in cfg["finishing_status"]:
-        errors.append(f"Invalid finishing_status; options: {cfg['finishing_status']}")
-    if area not in cfg["areas"]:
-        errors.append(f"Invalid area; options: {cfg['areas']}")
-    allowed = cfg["area_compounds"].get(area, [])
-    if comp not in allowed:
-        errors.append(f"Invalid compound for {area}; options: {allowed}")
-    if errors:
-        return jsonify({"error": " ; ".join(errors)}), 400
+    if validation_errors:
+        return jsonify({"error": " | ".join(validation_errors)}), 400
 
-    # Compute compound_avg internally
-    cavg = cfg["compound_avg"].get(comp, cfg["global_avg"])
-
-    # Build DataFrame exactly as training pipeline expected
-    df = pd.DataFrame([{
-        "size": size,
-        "bedrooms": bedrooms,
-        "bathrooms": bathrooms,
-        "finishing_status": fs,
-        "area": area,
-        "compound": comp,
-        "compound_avg": cavg
-    }])
-
-    # Predict using loaded model
+    # Prepare features DataFrame
     try:
-        raw_price = model.predict(df)[0]
-        # Convert NumPy scalar (e.g., float32) to native Python float
-        price = float(raw_price)
+        compound_avg = cfg["compound_avg"].get(
+            data["compound"], 
+            cfg["global_avg"]
+        )
+        
+        features = pd.DataFrame([{
+            "size": numeric_data["size"],
+            "bedrooms": numeric_data["bedrooms"],
+            "bathrooms": numeric_data["bathrooms"],
+            "finishing_status": data["finishing_status"],
+            "area": data["area"],
+            "compound": data["compound"],
+            "compound_avg": compound_avg
+        }])
+        
+        # Make prediction
+        prediction = model.predict(features)[0]
+        return jsonify({
+            "predicted_price": float(prediction),
+            "currency": "EGP",
+            "model_version": "1.0"
+        }), 200
+        
     except Exception as e:
-        return jsonify({"error":f"Prediction failed: {str(e)}"}), 500
+        app.logger.error(f"Prediction error: {str(e)}")
+        return jsonify({"error": "Prediction failed"}), 500
 
-    return jsonify({"predicted_price": price})
+# ========================================================================
+# Health Check and Server Configuration
+# ========================================================================
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint for service health verification"""
+    return jsonify({
+        "status": "healthy",
+        "version": "1.0",
+        "dependencies": {
+            "model_loaded": True,
+            "config_loaded": True
+        }
+    }), 200
 
 if __name__ == '__main__':
-    # Run on localhost:5000 in debug mode
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Render-specific configuration
+    port = int(os.environ.get("PORT", 5000))  # Get PORT from environment
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        # Never enable debug in production!
+        debug=False  
+    )
